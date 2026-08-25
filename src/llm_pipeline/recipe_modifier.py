@@ -1,258 +1,300 @@
-"""
-Step 2: Recipe Modification
+"""Deterministic policy and transactional recipe editing."""
 
-This module applies structured modifications to recipes using search-and-replace operations.
-It takes ModificationObject instances and applies their edits to recipe ingredients and instructions.
-"""
+from __future__ import annotations
 
-import copy
-from difflib import SequenceMatcher
-from typing import List, Optional, Tuple
-
-from loguru import logger
+from collections import Counter
+from dataclasses import dataclass
+from hashlib import sha256
 
 from .models import (
-    ModificationObject,
-    ModificationEdit,
+    Actionability,
+    CandidateRecipe,
+    ChangeRecord,
+    DecisionStatus,
+    EvidenceState,
+    IntentDecision,
+    ModificationIntent,
+    Operation,
     Recipe,
-    ChangeRecord
+    RecipeLine,
+    ReviewAnalysis,
+    ReviewDecision,
+    ReviewEvidence,
+    Section,
 )
 
 
-class RecipeModifier:
-    """Applies structured modifications to recipes using search-and-replace operations."""
+@dataclass
+class _WorkingLine:
+    line_id: str
+    section: Section
+    text: str
 
-    def __init__(self, similarity_threshold: float = 0.6):
-        """
-        Initialize the RecipeModifier.
 
-        Args:
-            similarity_threshold: Minimum similarity score for fuzzy matching (0-1)
-        """
-        self.similarity_threshold = similarity_threshold
-        logger.info(f"Initialized RecipeModifier with similarity threshold: {similarity_threshold}")
+def _execution_errors(
+    intent: ModificationIntent,
+    review: ReviewEvidence,
+    line_index: dict[str, RecipeLine],
+    performed_ids: set[str],
+) -> list[str]:
+    errors: list[str] = []
+    if intent.source_quote not in review.text:
+        errors.append("SOURCE_QUOTE_NOT_GROUNDED")
+    if intent.actionability is not Actionability.ACTIONABLE:
+        errors.append("INTENT_NOT_ACTIONABLE")
+    if intent.missing_information:
+        errors.append("MISSING_INFORMATION")
+    if not intent.edits:
+        errors.append("INCOMPLETE_EXECUTION_FIELDS")
+        return errors
 
-    def find_best_match(self, target: str, candidates: List[str]) -> Tuple[Optional[str], Optional[int], float]:
-        """
-        Find the best matching string in a list of candidates.
+    edit_ids = [edit.edit_id for edit in intent.edits]
+    if len(edit_ids) != len(set(edit_ids)):
+        errors.append("DUPLICATE_EDIT_ID")
 
-        Args:
-            target: String to find
-            candidates: List of strings to search in
+    for edit in intent.edits:
+        target = line_index.get(edit.target_line_id)
+        if target is None:
+            errors.append("TARGET_LINE_NOT_FOUND")
+            continue
+        if target.text != edit.expected_text:
+            errors.append("PRECONDITION_MISMATCH")
+        if edit.operation is Operation.REPLACE_LINE:
+            if not edit.replacement_text:
+                errors.append("REPLACEMENT_TEXT_MISSING")
+            elif edit.replacement_text == edit.expected_text:
+                errors.append("NO_OP")
+            if edit.insert_text:
+                errors.append("REPLACE_HAS_INSERT_TEXT")
+        elif edit.operation is Operation.INSERT_AFTER:
+            if not edit.insert_text:
+                errors.append("INSERT_TEXT_MISSING")
+            if edit.replacement_text:
+                errors.append("INSERT_HAS_REPLACEMENT_TEXT")
+        elif edit.operation is Operation.REMOVE_LINE and (
+            edit.replacement_text or edit.insert_text
+        ):
+            errors.append("REMOVE_HAS_OUTPUT_TEXT")
 
-        Returns:
-            Tuple of (best_match, index, similarity_score)
-        """
-        if not candidates:
-            return None, None, 0.0
+    if any(required not in performed_ids for required in intent.requires_intent_ids):
+        errors.append("DEPENDENCY_NOT_PERFORMED")
+    if intent.intent_id in intent.requires_intent_ids:
+        errors.append("SELF_DEPENDENCY")
+    if len(intent.requires_intent_ids) != len(set(intent.requires_intent_ids)):
+        errors.append("DUPLICATE_DEPENDENCY")
+    return errors
 
-        best_match = None
-        best_index = None
-        best_score = 0.0
 
-        for i, candidate in enumerate(candidates):
-            similarity = SequenceMatcher(None, target.lower(), candidate.lower()).ratio()
-            if similarity > best_score:
-                best_score = similarity
-                best_match = candidate
-                best_index = i
+def _apply_bundle(
+    recipe: Recipe,
+    recipe_lines: list[RecipeLine],
+    review: ReviewEvidence,
+    intents: list[ModificationIntent],
+) -> tuple[Recipe, list[ChangeRecord]]:
+    working = [
+        _WorkingLine(line_id=line.line_id, section=line.section, text=line.text)
+        for line in recipe_lines
+    ]
+    indexed_edits = [
+        (ordinal, intent, edit)
+        for ordinal, (intent, edit) in enumerate(
+            (intent, edit) for intent in intents for edit in intent.edits
+        )
+    ]
+    application_order = [
+        *reversed([item for item in indexed_edits if item[2].operation is Operation.INSERT_AFTER]),
+        *[item for item in indexed_edits if item[2].operation is Operation.REPLACE_LINE],
+        *[item for item in indexed_edits if item[2].operation is Operation.REMOVE_LINE],
+    ]
+    indexed_changes: list[tuple[int, ChangeRecord]] = []
 
-        if best_score >= self.similarity_threshold:
-            return best_match, best_index, best_score
-        else:
-            return None, None, best_score
+    for ordinal, intent, edit in application_order:
+        index = next(
+            position for position, line in enumerate(working) if line.line_id == edit.target_line_id
+        )
+        target = working[index]
+        if target.text != edit.expected_text:
+            raise ValueError("Transactional precondition changed during application")
 
-    def apply_edit(
-        self,
-        edit: ModificationEdit,
-        recipe_content: List[str]
-    ) -> Tuple[List[str], List[ChangeRecord]]:
-        """
-        Apply a single edit to a recipe content list.
+        before: str | None = target.text
+        after: str | None = None
+        changed_line_id = target.line_id
+        if edit.operation is Operation.REPLACE_LINE:
+            after = edit.replacement_text
+            target.text = after or ""
+        elif edit.operation is Operation.REMOVE_LINE:
+            working.pop(index)
+        elif edit.operation is Operation.INSERT_AFTER:
+            before = None
+            after = edit.insert_text
+            provenance = f"{review.review_id}:{edit.edit_id}"
+            provenance_digest = sha256(provenance.encode("utf-8")).hexdigest()[:16]
+            changed_line_id = f"inserted:{review.featured_rank}:{provenance_digest}"
+            working.insert(
+                index + 1,
+                _WorkingLine(
+                    line_id=changed_line_id,
+                    section=target.section,
+                    text=after or "",
+                ),
+            )
+        else:  # pragma: no cover - schema enum keeps this unreachable
+            raise ValueError(f"Unsupported operation: {edit.operation}")
 
-        Args:
-            edit: The edit operation to apply
-            recipe_content: List of ingredients or instructions
-
-        Returns:
-            Tuple of (modified_content, change_records)
-        """
-        modified_content = copy.deepcopy(recipe_content)
-        change_records = []
-
-        logger.debug(f"Applying {edit.operation} edit: find='{edit.find}'")
-
-        if edit.operation == "replace":
-            # Find and replace text
-            match, index, score = self.find_best_match(edit.find, modified_content)
-
-            if match and index is not None:
-                original_text = modified_content[index]
-                new_text = original_text.replace(edit.find, edit.replace or "")
-                modified_content[index] = new_text
-
-                change_records.append(ChangeRecord(
-                    type="ingredient" if edit.target == "ingredients" else "instruction",
-                    from_text=original_text,
-                    to_text=new_text,
-                    operation="replace"
-                ))
-
-                logger.info(f"Replaced '{edit.find}' with '{edit.replace}' (similarity: {score:.2f})")
-            else:
-                logger.warning(f"Could not find '{edit.find}' in {edit.target} (best similarity: {score:.2f})")
-
-        elif edit.operation == "add_after":
-            # Add new content after finding target
-            match, index, score = self.find_best_match(edit.find, modified_content)
-
-            if match and index is not None and edit.add:
-                modified_content.insert(index + 1, edit.add)
-
-                change_records.append(ChangeRecord(
-                    type="ingredient" if edit.target == "ingredients" else "instruction",
-                    from_text="",
-                    to_text=edit.add,
-                    operation="add"
-                ))
-
-                logger.info(f"Added '{edit.add}' after '{edit.find}' (similarity: {score:.2f})")
-            else:
-                logger.warning(f"Could not find target '{edit.find}' for addition")
-
-        elif edit.operation == "remove":
-            # Remove matching content
-            match, index, score = self.find_best_match(edit.find, modified_content)
-
-            if match and index is not None:
-                removed_text = modified_content.pop(index)
-
-                change_records.append(ChangeRecord(
-                    type="ingredient" if edit.target == "ingredients" else "instruction",
-                    from_text=removed_text,
-                    to_text="",
-                    operation="remove"
-                ))
-
-                logger.info(f"Removed '{edit.find}' (similarity: {score:.2f})")
-            else:
-                logger.warning(f"Could not find '{edit.find}' to remove")
-
-        return modified_content, change_records
-
-    def apply_modification(
-        self,
-        recipe: Recipe,
-        modification: ModificationObject
-    ) -> Tuple[Recipe, List[ChangeRecord]]:
-        """
-        Apply a complete modification to a recipe.
-
-        Args:
-            recipe: Original recipe to modify
-            modification: Structured modification to apply
-
-        Returns:
-            Tuple of (modified_recipe, all_change_records)
-        """
-        logger.info(f"Applying {modification.modification_type} with {len(modification.edits)} edits")
-
-        # Deep copy the recipe
-        modified_recipe = Recipe(
-            recipe_id=f"{recipe.recipe_id}_modified",
-            title=recipe.title,
-            ingredients=copy.deepcopy(recipe.ingredients),
-            instructions=copy.deepcopy(recipe.instructions),
-            description=recipe.description,
-            servings=recipe.servings,
-            rating=recipe.rating
+        indexed_changes.append(
+            (
+                ordinal,
+                ChangeRecord(
+                    intent_id=intent.intent_id,
+                    edit_id=edit.edit_id,
+                    line_id=changed_line_id,
+                    section=target.section,
+                    operation=edit.operation,
+                    before=before,
+                    after=after,
+                    source_quote=intent.source_quote,
+                ),
+            )
         )
 
-        all_change_records = []
+    candidate = Recipe(
+        recipe_id=f"{recipe.recipe_id}--variant--{review.featured_rank}",
+        title=recipe.title,
+        ingredients=[line.text for line in working if line.section is Section.INGREDIENTS],
+        instructions=[line.text for line in working if line.section is Section.INSTRUCTIONS],
+        description=recipe.description,
+        servings=recipe.servings,
+        rating=recipe.rating,
+    )
+    return candidate, [record for _, record in sorted(indexed_changes, key=lambda item: item[0])]
 
-        # Apply each edit
-        for edit in modification.edits:
-            if edit.target == "ingredients":
-                modified_recipe.ingredients, change_records = self.apply_edit(
-                    edit, modified_recipe.ingredients
-                )
-            elif edit.target == "instructions":
-                modified_recipe.instructions, change_records = self.apply_edit(
-                    edit, modified_recipe.instructions
-                )
-            else:
-                logger.warning(f"Unknown edit target: {edit.target}")
-                continue
 
-            all_change_records.extend(change_records)
+def evaluate_review_bundle(
+    recipe: Recipe,
+    recipe_lines: list[RecipeLine],
+    review: ReviewEvidence,
+    analysis: ReviewAnalysis,
+) -> tuple[ReviewDecision, CandidateRecipe | None]:
+    """Apply all safe performed intents together, or none of them."""
+    line_index = {line.line_id: line for line in recipe_lines}
+    performed_positions = [
+        position
+        for position, intent in enumerate(analysis.intents)
+        if intent.evidence_state is EvidenceState.PERFORMED
+    ]
+    performed = [analysis.intents[position] for position in performed_positions]
+    performed_ids = {intent.intent_id for intent in performed}
+    decisions: list[IntentDecision | None] = [None] * len(analysis.intents)
 
-        logger.info(f"Applied modification successfully: {len(all_change_records)} changes made")
-        return modified_recipe, all_change_records
+    intent_id_counts = Counter(intent.intent_id for intent in analysis.intents)
+    duplicate_ids = {intent_id for intent_id, count in intent_id_counts.items() if count > 1}
+    edit_id_counts = Counter(edit.edit_id for intent in analysis.intents for edit in intent.edits)
+    duplicate_edit_ids = {edit_id for edit_id, count in edit_id_counts.items() if count > 1}
+    known_intent_ids = set(intent_id_counts)
+    review_errors: list[str] = []
+    if analysis.review_id != review.review_id:
+        review_errors.append("ANALYSIS_REVIEW_ID_MISMATCH")
+    if duplicate_ids:
+        review_errors.append("DUPLICATE_INTENT_ID")
+    if duplicate_edit_ids:
+        review_errors.append("DUPLICATE_EDIT_ID")
+    for claim in analysis.outcome_claims:
+        if claim.source_quote not in review.text:
+            review_errors.append("OUTCOME_QUOTE_NOT_GROUNDED")
+        if any(intent_id not in known_intent_ids for intent_id in claim.supports_intent_ids):
+            review_errors.append("OUTCOME_UNKNOWN_INTENT_REFERENCE")
+        if len(claim.supports_intent_ids) != len(set(claim.supports_intent_ids)):
+            review_errors.append("OUTCOME_DUPLICATE_INTENT_REFERENCE")
 
-    def apply_modifications_batch(
-        self,
-        recipe: Recipe,
-        modifications: List[ModificationObject]
-    ) -> Tuple[Recipe, List[List[ChangeRecord]]]:
-        """
-        Apply multiple modifications to a recipe sequentially.
+    operations_by_target: dict[str, list[Operation]] = {}
+    insert_text_by_target: dict[str, list[str]] = {}
+    for intent in performed:
+        for edit in intent.edits:
+            operations_by_target.setdefault(edit.target_line_id, []).append(edit.operation)
+            if edit.operation is Operation.INSERT_AFTER and edit.insert_text:
+                insert_text_by_target.setdefault(edit.target_line_id, []).append(edit.insert_text)
 
-        Args:
-            recipe: Original recipe to modify
-            modifications: List of modifications to apply
+    conflicting_targets = {
+        target
+        for target, operations in operations_by_target.items()
+        if len(operations) > 1
+        and (
+            Operation.REMOVE_LINE in operations
+            or operations.count(Operation.REPLACE_LINE) > 1
+            or len(insert_text_by_target.get(target, []))
+            != len(set(insert_text_by_target.get(target, [])))
+        )
+    }
 
-        Returns:
-            Tuple of (final_modified_recipe, list_of_change_records_per_modification)
-        """
-        current_recipe = recipe
-        all_change_records = []
+    bundle_errors: list[str] = list(review_errors)
+    errors_by_position: dict[int, list[str]] = {}
+    for position, intent in zip(performed_positions, performed, strict=True):
+        errors = _execution_errors(intent, review, line_index, performed_ids)
+        if intent.intent_id in duplicate_ids:
+            errors.append("DUPLICATE_INTENT_ID")
+        if any(edit.edit_id in duplicate_edit_ids for edit in intent.edits):
+            errors.append("DUPLICATE_EDIT_ID")
+        if any(edit.target_line_id in conflicting_targets for edit in intent.edits):
+            errors.append("MULTIPLE_EDITS_TO_SAME_TARGET")
+        errors_by_position[position] = errors
+        bundle_errors.extend(errors)
 
-        logger.info(f"Applying {len(modifications)} modifications sequentially")
+    for position, intent in enumerate(analysis.intents):
+        if intent.evidence_state is not EvidenceState.PERFORMED:
+            reasons = [f"EVIDENCE_STATE_{intent.evidence_state.value.upper()}"]
+            if intent.source_quote not in review.text:
+                reasons.append("SOURCE_QUOTE_NOT_GROUNDED")
+            if intent.intent_id in duplicate_ids:
+                reasons.append("DUPLICATE_INTENT_ID")
+            if any(edit.edit_id in duplicate_edit_ids for edit in intent.edits):
+                reasons.append("DUPLICATE_EDIT_ID")
+            decisions[position] = IntentDecision(
+                intent_id=intent.intent_id,
+                status=DecisionStatus.NOT_APPLIED,
+                reasons=sorted(set(reasons)),
+            )
 
-        for i, modification in enumerate(modifications):
-            logger.info(f"Applying modification {i + 1}/{len(modifications)}: {modification.modification_type}")
+    if not performed:
+        status = DecisionStatus.NEEDS_REVIEW if review_errors else DecisionStatus.NOT_APPLIED
+        return ReviewDecision(
+            review_id=review.review_id,
+            bundle_status=status,
+            intent_decisions=[decision for decision in decisions if decision is not None],
+            reasons=sorted({"NO_PERFORMED_INTENTS", *review_errors}),
+        ), None
 
-            current_recipe, change_records = self.apply_modification(current_recipe, modification)
-            all_change_records.append(change_records)
+    if bundle_errors:
+        for position, intent in zip(performed_positions, performed, strict=True):
+            reasons = errors_by_position[position]
+            if not reasons:
+                reasons = ["PERFORMED_BUNDLE_ATOMICITY"]
+            decisions[position] = IntentDecision(
+                intent_id=intent.intent_id,
+                status=DecisionStatus.NEEDS_REVIEW,
+                reasons=sorted(set(reasons)),
+            )
+        return ReviewDecision(
+            review_id=review.review_id,
+            bundle_status=DecisionStatus.NEEDS_REVIEW,
+            intent_decisions=[decision for decision in decisions if decision is not None],
+            reasons=sorted(set(bundle_errors)),
+        ), None
 
-        logger.info(f"Applied all modifications. Final recipe has {len(current_recipe.ingredients)} ingredients and {len(current_recipe.instructions)} instructions")
-        return current_recipe, all_change_records
-
-    def validate_modification_safety(
-        self,
-        modification: ModificationObject,
-        recipe: Recipe
-    ) -> Tuple[bool, List[str]]:
-        """
-        Validate that a modification won't break the recipe.
-
-        Args:
-            modification: Modification to validate
-            recipe: Recipe being modified
-
-        Returns:
-            Tuple of (is_safe, list_of_warnings)
-        """
-        warnings = []
-        is_safe = True
-
-        for edit in modification.edits:
-            # Check if target content exists
-            target_content = recipe.ingredients if edit.target == "ingredients" else recipe.instructions
-            match, _, score = self.find_best_match(edit.find, target_content)
-
-            if not match:
-                warnings.append(f"Cannot find '{edit.find}' in {edit.target}")
-                is_safe = False
-            elif score < 0.8:
-                warnings.append(f"Low similarity match for '{edit.find}' (score: {score:.2f})")
-
-            # Check for required fields
-            if edit.operation == "replace" and not edit.replace:
-                warnings.append(f"Replace operation missing replacement text for '{edit.find}'")
-                is_safe = False
-            elif edit.operation == "add_after" and not edit.add:
-                warnings.append(f"Add operation missing text to add after '{edit.find}'")
-                is_safe = False
-
-        return is_safe, warnings
+    candidate_recipe, changes = _apply_bundle(recipe, recipe_lines, review, performed)
+    for position, intent in zip(performed_positions, performed, strict=True):
+        decisions[position] = IntentDecision(
+            intent_id=intent.intent_id,
+            status=DecisionStatus.APPLIED,
+        )
+    decision = ReviewDecision(
+        review_id=review.review_id,
+        bundle_status=DecisionStatus.APPLIED,
+        intent_decisions=[decision for decision in decisions if decision is not None],
+    )
+    candidate = CandidateRecipe(
+        candidate_id=f"{recipe.recipe_id}:candidate:{review.featured_rank}",
+        source_review_id=review.review_id,
+        recipe=candidate_recipe,
+        changes=changes,
+    )
+    return decision, candidate

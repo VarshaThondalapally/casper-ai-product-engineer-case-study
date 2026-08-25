@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "evaluation_version": "2.0.0",
+    "pipeline_version": "1.0.0",
+    "generated_at": "2026-08-25T13:24:55.681073-07:00",
+    "requested_model": "gpt-5.6-terra",
+    "source_state": "final live candidate, pinned by label/prompt/schema hashes",
+    "labels_sha256": "dd6bd71640a545a2ba5fd7d418f4e7054fba426de04003757bfaadef83d300bb",
+    "prompt_sha256": "ade5a216ea796702c64b702f1b45dbb98f863f66685f06830caa617f04ef6d83",
+    "schema_sha256": "6c33b028fb7c20b690f74e7c09d542ee12817c3bb51db3c21c9a204048d206d8",
+    "replayed_from_sha256": "557e50078dd42efcd5e6e106c8e1fdd3582c82a901c155a6246af5b00eecc5be",
+    "thresholds": {
+      "labeled_intent_recall": 0.8,
+      "labeled_intent_precision": 0.8,
+      "evidence_state_accuracy_on_matched": 0.9,
+      "intent_kind_accuracy_on_matched": 0.85,
+      "actionability_accuracy_on_matched": 0.85,
+      "source_quote_grounding": 1.0,
+      "outcome_label_recall": 0.9,
+      "outcome_quote_grounding": 1.0,
+      "bundle_status_accuracy": 1.0,
+      "candidate_presence_accuracy": 1.0,
+      "edit_target_operation_recall": 1.0,
+      "edit_precondition_accuracy": 1.0,
+      "edit_output_constraint_accuracy": 1.0,
+      "exact_applied_bundle_accuracy": 1.0
+    }
+  },
+  "metrics": {
+    "labeled_intent_recall": 0.8823529411764706,
+    "labeled_intent_precision": 0.8108108108108109,
+    "evidence_state_accuracy_on_matched": 1.0,
+    "intent_kind_accuracy_on_matched": 0.9333333333333333,
+    "actionability_accuracy_on_matched": 0.9,
+    "source_quote_grounding": 1.0,
+    "outcome_label_recall": 1.0,
+    "outcome_quote_grounding": 1.0,
+    "bundle_status_accuracy": 1.0,
+    "candidate_presence_accuracy": 1.0,
+    "edit_target_operation_recall": 1.0,
+    "edit_target_operation_precision": 1.0,
+    "edit_precondition_accuracy": 1.0,
+    "edit_output_constraint_accuracy": 1.0,
+    "exact_applied_bundle_accuracy": 1.0,
+    "labels": 34,
+    "matched_labels": 30,
+    "outcome_labels": 20,
+    "matched_outcomes": 20,
+    "expected_edits": 14,
+    "matched_edits": 14,
+    "failed_cases": 0,
+    "input_tokens": 27404,
+    "output_tokens": 12652,
+    "canonicalized_source_quotes": 0,
+    "latency_seconds": 157.162,
+    "bundle_counts": {
+      "applied": 3,
+      "needs_review": 7,
+      "not_applied": 2
+    },
+    "candidates": 3
+  },
+  "threshold_failures": [],
+  "notes": [
+    "This summary was deterministically rescored from the final live extraction report; no model call was made during replay.",
+    "Replay changed only scoring for explicitly accepted equivalent fractions and insertion anchors, not extracted model output.",
+    "The full per-case live report remains an ignored local artifact because it contains complete review and model output content.",
+    "Outcome anchors are primary recall checks rather than an exhaustive outcome set, so outcome precision is not claimed."
+  ]
+}

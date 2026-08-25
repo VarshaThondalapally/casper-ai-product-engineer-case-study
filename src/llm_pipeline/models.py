@@ -1,144 +1,263 @@
-"""
-Pydantic data models for the LLM Analysis Pipeline.
+"""Contracts shared by semantic extraction and deterministic execution."""
 
-These models define the structure for recipe modifications, enhanced recipes,
-and all intermediate data formats used throughout the pipeline.
-"""
+from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from enum import Enum
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+from .version import TRACE_VERSION
+
+Identifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+ShortText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+EvidenceText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000),
+]
+LineText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=4_000),
+]
 
 
-class ModificationEdit(BaseModel):
-    """Individual atomic edit operation for a recipe modification."""
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    target: Literal["ingredients", "instructions"] = Field(
-        description="Whether this edit applies to ingredients or instructions"
+
+class Section(str, Enum):
+    INGREDIENTS = "ingredients"
+    INSTRUCTIONS = "instructions"
+
+
+class EvidenceState(str, Enum):
+    PERFORMED = "performed"
+    RECOMMENDED = "recommended"
+    FUTURE = "future"
+    HYPOTHETICAL = "hypothetical"
+    PREFERENCE = "preference"
+    UNCLEAR = "unclear"
+
+
+class Actionability(str, Enum):
+    ACTIONABLE = "actionable"
+    INCOMPLETE = "incomplete"
+    NON_ACTIONABLE = "non_actionable"
+
+
+class IntentKind(str, Enum):
+    QUANTITY_ADJUSTMENT = "quantity_adjustment"
+    INGREDIENT_SUBSTITUTION = "ingredient_substitution"
+    INGREDIENT_ADDITION = "ingredient_addition"
+    INGREDIENT_REMOVAL = "ingredient_removal"
+    TECHNIQUE_CHANGE = "technique_change"
+    EQUIPMENT_CHANGE = "equipment_change"
+    SERVING_CHANGE = "serving_change"
+    OTHER = "other"
+
+
+class Operation(str, Enum):
+    REPLACE_LINE = "replace_line"
+    REMOVE_LINE = "remove_line"
+    INSERT_AFTER = "insert_after"
+
+
+class DecisionStatus(str, Enum):
+    APPLIED = "applied"
+    NEEDS_REVIEW = "needs_review"
+    NOT_APPLIED = "not_applied"
+
+
+class Recipe(StrictModel):
+    recipe_id: Identifier
+    title: ShortText
+    ingredients: list[LineText] = Field(min_length=1, max_length=500)
+    instructions: list[LineText] = Field(min_length=1, max_length=500)
+    description: EvidenceText | None = None
+    servings: str | int | None = None
+    rating: dict[str, Any] | None = None
+
+
+class RecipeLine(StrictModel):
+    line_id: Identifier
+    section: Section
+    position: int = Field(ge=0)
+    text: LineText
+
+
+class ReviewEvidence(StrictModel):
+    review_id: Identifier
+    text: EvidenceText
+    rating: int | None = Field(default=None, ge=1, le=5)
+    featured_rank: int = Field(ge=0)
+
+
+class OutcomeClaim(StrictModel):
+    source_quote: EvidenceText = Field(description="Exact quote from the review")
+    claim: EvidenceText
+    supports_intent_ids: list[Identifier] = Field(default_factory=list, max_length=100)
+
+
+class RecipeEdit(StrictModel):
+    """One exact line mutation; an intent may require several coordinated edits."""
+
+    edit_id: Identifier
+    target_line_id: Identifier
+    operation: Operation
+    expected_text: LineText = Field(description="Exact full text of the target recipe line")
+    replacement_text: LineText | None = Field(
+        default=None, description="Complete new line for replace_line"
     )
-    operation: Literal["replace", "add_after", "remove"] = Field(
-        default="replace",
-        description="Type of operation: replace text, add after target, or remove",
-    )
-    find: str = Field(description="Text to find in the recipe")
-    replace: Optional[str] = Field(
-        default=None, description="Replacement text (required for replace operations)"
-    )
-    add: Optional[str] = Field(
-        default=None, description="Text to add (required for add_after operations)"
-    )
-
-
-class ModificationObject(BaseModel):
-    """Structured modification parsed from a review."""
-
-    modification_type: Literal[
-        "ingredient_substitution",
-        "quantity_adjustment",
-        "technique_change",
-        "addition",
-        "removal",
-    ] = Field(description="Category of modification")
-
-    reasoning: str = Field(description="Why this modification improves the recipe")
-
-    edits: List[ModificationEdit] = Field(description="List of atomic edits to apply")
-
-
-class SourceReview(BaseModel):
-    """Reference to the original review that suggested the modification."""
-
-    text: str = Field(description="Full text of the original review")
-    reviewer: Optional[str] = Field(description="Username of the reviewer")
-    rating: Optional[int] = Field(description="Star rating given by reviewer")
-
-
-class ChangeRecord(BaseModel):
-    """Record of a specific change made to the recipe."""
-
-    type: Literal["ingredient", "instruction"] = Field(
-        description="Type of element that was changed"
-    )
-    from_text: str = Field(description="Original text before modification")
-    to_text: str = Field(description="New text after modification")
-    operation: Literal["replace", "add", "remove"] = Field(
-        description="Type of operation performed"
-    )
-
-
-class ModificationApplied(BaseModel):
-    """Full record of a modification that was applied to a recipe."""
-
-    source_review: SourceReview = Field(
-        description="Review that suggested this modification"
-    )
-    modification_type: str = Field(description="Category of modification")
-    reasoning: str = Field(description="Why this modification was applied")
-    changes_made: List[ChangeRecord] = Field(
-        description="Detailed list of changes made"
-    )
-
-
-class EnhancementSummary(BaseModel):
-    """Summary of all modifications applied to a recipe."""
-
-    total_changes: int = Field(description="Total number of changes made")
-    change_types: List[str] = Field(description="Types of modifications applied")
-    expected_impact: str = Field(
-        description="Expected improvement from these modifications"
-    )
-
-
-class EnhancedRecipe(BaseModel):
-    """Recipe with community modifications applied and full attribution."""
-
-    recipe_id: str = Field(description="Enhanced recipe ID")
-    original_recipe_id: str = Field(description="ID of the original recipe")
-    title: str = Field(description="Enhanced recipe title")
-
-    # Enhanced recipe content
-    ingredients: List[str] = Field(description="Modified ingredients list")
-    instructions: List[str] = Field(description="Modified instructions list")
-
-    # Attribution and tracking
-    modifications_applied: List[ModificationApplied] = Field(
-        description="Full record of all modifications applied"
-    )
-    enhancement_summary: EnhancementSummary = Field(
-        description="Summary of all enhancements"
-    )
-
-    # Optional metadata
-    description: Optional[str] = Field(description="Enhanced recipe description")
-    servings: Optional[str] = Field(description="Number of servings")
-    prep_time: Optional[str] = Field(description="Preparation time")
-    cook_time: Optional[str] = Field(description="Cooking time")
-    total_time: Optional[str] = Field(description="Total time")
-
-    # Generation metadata
-    created_at: str = Field(description="When this enhanced recipe was created")
-    pipeline_version: str = Field(
-        default="1.0.0", description="Version of the pipeline that created this"
+    insert_text: LineText | None = Field(
+        default=None, description="Complete new line for insert_after"
     )
 
 
-class Recipe(BaseModel):
-    """Base recipe model for input data."""
+class ModificationIntent(StrictModel):
+    """One semantic tweak; executable fields may be null when evidence is incomplete."""
 
-    recipe_id: str
-    title: str
-    ingredients: List[str]
-    instructions: List[str]
-    description: Optional[str] = None
-    servings: Optional[str] = None
-    rating: Optional[Dict[str, Any]] = None
-    # Include other fields as needed
+    intent_id: Identifier
+    kind: IntentKind
+    source_quote: EvidenceText = Field(
+        description="Shortest exact review quote supporting this intent"
+    )
+    evidence_state: EvidenceState
+    actionability: Actionability
+    edits: list[RecipeEdit] = Field(default_factory=list)
+    rationale: EvidenceText | None = None
+    missing_information: list[ShortText] = Field(default_factory=list, max_length=100)
+    requires_intent_ids: list[Identifier] = Field(default_factory=list, max_length=100)
 
 
-class Review(BaseModel):
-    """Review model for input data."""
+class ReviewAnalysis(StrictModel):
+    review_id: Identifier
+    sentiment: ShortText
+    intents: list[ModificationIntent] = Field(max_length=100)
+    outcome_claims: list[OutcomeClaim] = Field(default_factory=list, max_length=100)
 
-    text: str
-    rating: Optional[int] = None
-    username: Optional[str] = None
-    has_modification: bool = False
+
+class ChangeRecord(StrictModel):
+    intent_id: Identifier
+    edit_id: Identifier
+    line_id: Identifier
+    section: Section
+    operation: Operation
+    before: LineText | None
+    after: LineText | None
+    source_quote: EvidenceText
+
+
+class IntentDecision(StrictModel):
+    intent_id: Identifier
+    status: DecisionStatus
+    reasons: list[str] = Field(default_factory=list)
+
+
+class ReviewDecision(StrictModel):
+    review_id: Identifier
+    bundle_status: DecisionStatus
+    intent_decisions: list[IntentDecision]
+    reasons: list[str] = Field(default_factory=list)
+
+
+class CandidateRecipe(StrictModel):
+    candidate_id: Identifier
+    source_review_id: Identifier
+    relationship: Literal["alternative"] = "alternative"
+    recipe: Recipe
+    changes: list[ChangeRecord]
+
+
+class ModelCallStats(StrictModel):
+    review_id: Identifier
+    model: ShortText
+    response_id: str | None = None
+    status: str | None = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    latency_seconds: float = Field(default=0.0, ge=0)
+    canonicalized_source_quotes: int = Field(default=0, ge=0)
+
+
+class TraceRequest(StrictModel):
+    """Serializable API boundary; credentials and HTTP headers are never included."""
+
+    endpoint: str = "responses.parse"
+    model: str
+    instructions: str
+    input: str
+    text_format: str
+    output_schema: dict[str, Any]
+    reasoning: dict[str, str]
+    max_output_tokens: int
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    parallel_tool_calls: bool
+    store: bool
+
+
+class TraceResponse(StrictModel):
+    response_id: str | None = None
+    model: str
+    status: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_seconds: float
+    output_text: str | None = None
+    output_parsed: ReviewAnalysis | None = None
+
+
+class ModelCallTrace(StrictModel):
+    review_id: Identifier
+    request: TraceRequest
+    response: TraceResponse | None = None
+    error: str | None = None
+
+
+class ExtractionCall(StrictModel):
+    analysis: ReviewAnalysis
+    stats: ModelCallStats
+    trace: ModelCallTrace | None = None
+
+
+class PolicyTrace(StrictModel):
+    review_id: Identifier
+    decision: ReviewDecision
+    candidate: CandidateRecipe | None = None
+
+
+class RunTrace(StrictModel):
+    trace_version: str = TRACE_VERSION
+    recipe_id: Identifier
+    model_calls: list[ModelCallTrace]
+    policy_decisions: list[PolicyTrace]
+    extraction_failures: dict[str, str] = Field(default_factory=dict)
+    disclosure: list[str] = Field(
+        default_factory=lambda: [
+            "Trace contains the exact application-level API request, not credentials or headers.",
+            "Trace contains recipe and review content; treat it as potentially sensitive data.",
+            "OpenAI internal reasoning is not returned by the API and is not represented here.",
+        ]
+    )
+
+
+class PipelineResult(StrictModel):
+    pipeline_version: str
+    original_recipe: Recipe
+    featured_reviews: list[ReviewEvidence]
+    analyses: list[ReviewAnalysis]
+    decisions: list[ReviewDecision]
+    candidates: list[CandidateRecipe]
+    extraction_failures: dict[str, str] = Field(default_factory=dict)
+    model_calls: list[ModelCallStats] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class DirectoryRun(StrictModel):
+    results: list[PipelineResult]
+    file_failures: dict[str, str] = Field(default_factory=dict)

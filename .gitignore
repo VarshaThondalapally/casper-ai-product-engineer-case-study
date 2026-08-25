@@ -1,60 +1,27 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Poetry
-poetry.lock
+# Python environments and caches
 .venv/
 venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-.DS_Store
-
-# Project specific
-.env
-*.log
-logs/
-tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
-.pytest_cache/
 
+# Local configuration and editor state
+.env
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
 
-# Custom
-design/
-samples/
+# Build and runtime artifacts
+build/
+dist/
+*.egg-info/
+*.log
 logs/
-scratchpad.md
-test_output/
-scratch.py
-claude.md
-memory-bank/
-.claude/
-
-# Scorecard work - sensitive/large files
-scorecardwork/*
-
-# Candidate grading workspace - large files and sensitive data
-candidate-grading/
+outputs/
+data/enhanced/
+src/data/

@@ -1,0 +1,161 @@
+[
+  {
+    "recipe_id": "10813",
+    "featured_rank": 0,
+    "expected_bundle_status": "applied",
+    "labels": [
+      {"anchor": "used an ice cream scoop", "state": "performed", "kind": "equipment_change", "actionability": "actionable"},
+      {"anchor": "additional egg yolk", "state": "performed", "kind": "ingredient_addition", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["turned out fantastic"],
+    "expected_edits": [
+      {"target_line_id": "ingredient:3", "operation": "insert_after", "expected_text": "2 eggs", "output_contains": ["egg yolk"]},
+      {"target_line_id": "instruction:2", "operation": "replace_line", "expected_text": "Beat in eggs, one at a time, then stir in vanilla.", "output_contains": ["yolk"]},
+      {"target_line_id": "instruction:5", "operation": "replace_line", "expected_text": "Drop spoonfuls of dough 2 inches apart onto ungreased baking sheets.", "output_contains": ["ice cream scoop"]}
+    ]
+  },
+  {
+    "recipe_id": "10813",
+    "featured_rank": 1,
+    "expected_bundle_status": "applied",
+    "labels": [
+      {"anchor": "half cup of sugar", "state": "performed", "kind": "quantity_adjustment", "actionability": "actionable"},
+      {"anchor": "one-and-a-half cups of brown sugar", "state": "performed", "kind": "quantity_adjustment", "actionability": "actionable"},
+      {"anchor": "omitted the water", "state": "performed", "kind": "ingredient_removal", "actionability": "actionable"},
+      {"anchor": "teaspoon of cream of tartar", "state": "performed", "kind": "ingredient_addition", "actionability": "actionable"},
+      {"anchor": "refrigerated the batter", "state": "performed", "kind": "technique_change", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["retained their shape", "didn't spread", "not come out too cakey"],
+    "expected_edits": [
+      {"target_line_id": "ingredient:1", "operation": "replace_line", "expected_text": "1 cup white sugar", "output_contains": ["white sugar"], "output_any_contains": [["0.5", "1/2", "half cup"]]},
+      {"target_line_id": "ingredient:2", "operation": "replace_line", "expected_text": "1 cup packed brown sugar", "output_contains": ["brown sugar"], "output_any_contains": [["1.5", "1 1/2", "one-and-a-half"]]},
+      {"target_line_id": "ingredient:6", "operation": "remove_line", "expected_text": "2 teaspoons hot water", "output_contains": []},
+      {"target_line_id": "instruction:3", "operation": "replace_line", "expected_text": "Dissolve baking soda in hot water. Add to batter along with salt.", "output_contains": ["baking soda", "salt"]},
+      {"target_line_id": "ingredient:5", "accepted_target_line_ids": ["ingredient:5", "ingredient:6"], "operation": "insert_after", "expected_text": "1 teaspoon baking soda", "accepted_expected_texts": ["1 teaspoon baking soda", "2 teaspoons hot water"], "output_contains": ["1 teaspoon", "cream of tartar"]},
+      {"target_line_id": "instruction:3", "accepted_target_line_ids": ["instruction:2", "instruction:3"], "operation": "insert_after", "expected_text": "Dissolve baking soda in hot water. Add to batter along with salt.", "accepted_expected_texts": ["Beat in eggs, one at a time, then stir in vanilla.", "Dissolve baking soda in hot water. Add to batter along with salt."], "output_contains": ["cream of tartar"]},
+      {"target_line_id": "instruction:4", "operation": "insert_after", "expected_text": "Stir in flour, chocolate chips, and walnuts.", "output_contains": ["hour"], "output_any_contains": [["refrigerate", "chill"]]}
+    ]
+  },
+  {
+    "recipe_id": "10813",
+    "featured_rank": 2,
+    "expected_bundle_status": "applied",
+    "labels": [
+      {"anchor": "used 1 tsp. of salt", "state": "performed", "kind": "quantity_adjustment", "actionability": "actionable"},
+      {"anchor": "omitted the nuts", "state": "performed", "kind": "ingredient_removal", "actionability": "actionable"},
+      {"anchor": "pressed them down slightly", "state": "performed", "kind": "technique_change", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["This was better", "worked the best"],
+    "expected_edits": [
+      {"target_line_id": "ingredient:7", "operation": "replace_line", "expected_text": "0.5 teaspoon salt", "output_contains": ["1 teaspoon", "salt"]},
+      {"target_line_id": "ingredient:10", "operation": "remove_line", "expected_text": "1 cup chopped walnuts", "output_contains": []},
+      {"target_line_id": "instruction:4", "operation": "replace_line", "expected_text": "Stir in flour, chocolate chips, and walnuts.", "output_contains": ["flour", "chocolate chips"]},
+      {"target_line_id": "instruction:5", "operation": "insert_after", "expected_text": "Drop spoonfuls of dough 2 inches apart onto ungreased baking sheets.", "output_contains": ["press", "slightly"]}
+    ]
+  },
+  {
+    "recipe_id": "10813",
+    "featured_rank": 3,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "1/2 c of brown", "state": "performed", "kind": "quantity_adjustment", "actionability": "actionable"},
+      {"anchor": "1/2 c less flour", "state": "performed", "kind": "quantity_adjustment", "actionability": "actionable"},
+      {"anchor": "tiny dash of cinnamon", "state": "performed", "kind": "ingredient_addition", "actionability": "incomplete"}
+    ],
+    "outcome_anchors": ["They are phenomenal", "Crispy edges and gooey center"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "144299",
+    "featured_rank": 0,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "used a lil over 1lb", "state": "performed", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "added extra soy", "state": "performed", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "and sugar", "state": "performed", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "beef broth/stock works just fine", "state": "recommended", "kind": "ingredient_substitution", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["pretty good", "flavor was a little on the lite side"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "19117",
+    "featured_rank": 0,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "used a different frosting", "state": "performed", "kind": "ingredient_substitution", "actionability": "incomplete"},
+      {"anchor": "will add one more cup of apples", "state": "future", "kind": "quantity_adjustment", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["cake was so good"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "19117",
+    "featured_rank": 1,
+    "expected_bundle_status": "not_applied",
+    "labels": [
+      {"anchor": "prefer some more apple chunks", "state": "preference", "kind": "quantity_adjustment", "actionability": "incomplete"}
+    ],
+    "outcome_anchors": ["sweet and delicious"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "77935",
+    "featured_rank": 0,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "with canned yams", "state": "performed", "kind": "ingredient_substitution", "actionability": "incomplete"},
+      {"anchor": "added roasted Brussels Sprouts", "state": "performed", "kind": "ingredient_addition", "actionability": "incomplete"},
+      {"anchor": "and peppers", "state": "performed", "kind": "ingredient_addition", "actionability": "incomplete"},
+      {"anchor": "drizzled heavy cream", "state": "performed", "kind": "ingredient_addition", "actionability": "incomplete"}
+    ],
+    "outcome_anchors": ["Turned out amazing"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "77935",
+    "featured_rank": 1,
+    "expected_bundle_status": "not_applied",
+    "labels": [
+      {"anchor": "will use fresh ginger", "state": "future", "kind": "ingredient_substitution", "actionability": "incomplete"}
+    ],
+    "outcome_anchors": ["It was amazing", "portion is only enough for 2-3 people"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "77935",
+    "featured_rank": 2,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "3 white potatoes", "state": "performed", "kind": "ingredient_addition", "accepted_kinds": ["ingredient_addition", "ingredient_substitution"], "actionability": "incomplete"},
+      {"anchor": "substituted 2% milk", "state": "performed", "kind": "ingredient_substitution", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["turned out delicious"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "77935",
+    "featured_rank": 3,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "Even w 2% milk", "state": "performed", "kind": "ingredient_substitution", "actionability": "actionable"},
+      {"anchor": "will use more broth next time", "state": "future", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "Used fresh grated ginger", "state": "performed", "kind": "ingredient_substitution", "actionability": "incomplete"}
+    ],
+    "outcome_anchors": ["Very thick", "Hearty and yummy"],
+    "expected_edits": []
+  },
+  {
+    "recipe_id": "77935",
+    "featured_rank": 4,
+    "expected_bundle_status": "needs_review",
+    "labels": [
+      {"anchor": "work fine in the oven", "state": "hypothetical", "kind": "equipment_change", "accepted_kinds": ["equipment_change", "technique_change"], "actionability": "incomplete"},
+      {"anchor": "added extra cayenne pepper", "state": "performed", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "lots of black pepper", "state": "performed", "kind": "quantity_adjustment", "actionability": "incomplete"},
+      {"anchor": "used heavy cream", "state": "performed", "kind": "ingredient_substitution", "actionability": "actionable"}
+    ],
+    "outcome_anchors": ["vegetables caramelize beautifully", "didn't find it at all too sweet"],
+    "expected_edits": []
+  }
+]

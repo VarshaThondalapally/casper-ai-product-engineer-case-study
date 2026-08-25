@@ -1,106 +1,145 @@
-# Recipe Enhancement Platform
+# Recipe Review Evidence Pipeline
 
-Automatically enhances recipes by analyzing and applying community-tested modifications from AllRecipes.com. Uses LLM processing to extract meaningful recipe tweaks and apply them with full citation tracking.
+This project turns community-tested recipe tweaks into safe, attributed recipe
+alternatives. The LLM interprets open-ended language once; deterministic code
+decides whether the evidence is executable and applies exact edits.
 
-## Installation
+## Product semantics
 
-This project uses [`uv`](https://docs.astral.sh/uv/) for fast, reliable Python package management.
+- Every `featured_tweaks` review is analyzed. Non-featured reviews are not silently
+  mixed into the evidence set.
+- Every distinct tweak is extracted with an exact source quote and classified as
+  `performed`, `recommended`, `future`, `hypothetical`, `preference`, or `unclear`.
+- Only complete, grounded, performed tweaks can be applied.
+- Performed tweaks from one review are a co-tested bundle: all safe edits commit,
+  or none do.
+- Different reviews produce independent alternatives from the immutable original.
+  They are never naively merged or ranked without a helpful-vote signal.
+- Vague, conflicting, future, and preference evidence remains visible as
+  `needs_review` or `not_applied` instead of becoming a false success.
 
-### Prerequisites
+## Architecture
 
-- Python 3.13+
-- `uv` package manager
+```text
+featured review + stable recipe line IDs
+                 |
+                 v
+  one GPT-5.6 Terra structured extraction
+                 |
+                 v
+ grounding / evidence / precondition / conflict policy
+                 |
+                 v
+ transactional exact edits -> attributed alternative
+```
+
+The model cannot mutate a recipe. It returns strict Pydantic data containing
+semantic intents and one or more exact line edits per intent. The deterministic
+layer validates quote grounding, evidence state, actionability, dependencies,
+duplicate IDs, exact preconditions, no-ops, and target conflicts before editing.
+Input sizes and call counts are bounded; output identifiers are sanitized and
+resolved inside the configured output root.
 
 ## Setup
 
+Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
+
 ```bash
-# Install dependencies
-uv venv
-source .venv/bin/activate
-uv pip sync pyproject.toml
+uv sync --group dev
 ```
 
-### Environment Variables
-
-Create a `.env` file in the project root:
+For live extraction, copy `.env.example` to `.env` and set the key locally:
 
 ```env
-OPENAI_API_KEY=your-openai-api-key-here
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-5.6-terra
 ```
 
-## Usage
+Timeout, retry count, reasoning effort and output-token limits are optional,
+bounded environment settings documented in `.env.example`.
 
-### 1. Scrape Recipes (Optional - data already provided)
+## Run
+
+Deterministic tests do not call an API:
 
 ```bash
-uv run python src/scraper_v2.py
+uv run pytest --cov=llm_pipeline --cov=run_pipeline --cov-report=term-missing --cov-fail-under=90 -q
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run bandit -r src -q
 ```
 
-### 2. Run Recipe Enhancement Pipeline
+Run the six supplied recipes:
 
 ```bash
-cd src
-
-# Test single recipe (chocolate chip cookies)
-uv run python test_pipeline.py single
-
-# Process all recipes
-uv run python test_pipeline.py all
+uv run python src/run_pipeline.py data --output outputs
 ```
 
-## Output
-
-### Enhanced Recipes
-
-Enhanced recipes are saved in `src/data/enhanced/`:
-
-- `enhanced_[recipe_id]_[recipe-name].json` - Individual enhanced recipes with modifications applied
-- `pipeline_summary_report.json` - Summary of all processing results
-
-### Data Structure
-
-Original scraped recipes in `data/` directory contain reviews with `has_modification: true` flags. Enhanced recipes include:
-
-```json
-{
-  "recipe_id": "10813_enhanced",
-  "title": "Best Chocolate Chip Cookies (Community Enhanced)",
-  "ingredients": ["1 cup butter", "1 additional egg yolk", ...],
-  "modifications_applied": [
-    {
-      "source_review": {
-        "text": "I added an extra egg yolk for chewier texture",
-        "rating": 5
-      },
-      "modification_type": "addition",
-      "reasoning": "Improves texture and chewiness",
-      "changes_made": [...]
-    }
-  ],
-  "enhancement_summary": {
-    "total_changes": 1,
-    "change_types": ["addition"],
-    "expected_impact": "Chewier texture and improved consistency"
-  }
-}
-```
-
-## How It Works
-
-The LLM Analysis Pipeline processes recipes in 3 steps:
-
-1. **Tweak Extraction**: Selects one random review with modifications and uses GPT-4o-mini to extract structured changes
-2. **Recipe Modification**: Applies changes to the original recipe using fuzzy string matching
-3. **Enhanced Recipe Generation**: Creates enhanced version with full citation tracking back to source review
-
-Each run produces one enhanced recipe per original recipe, with complete attribution showing exactly what changed and why.
-
-## Development
+The command returns non-zero if any source file or model extraction fails. Capture
+the exact redacted API/policy boundary for a demo run with this PowerShell-safe,
+single-line command:
 
 ```bash
-# Add dependencies
-uv add <package_name>
-
-# Run tests
-cd src && uv run python test_pipeline.py single
+uv run python src/run_pipeline.py data/recipe_10813_best-chocolate-chip-cookies.json --output outputs/demo --trace
 ```
+
+Trace output is organized per review:
+
+```text
+outputs/demo/10813/trace/
+├── run-summary.json
+├── review-0-request.json
+├── review-0-response.json
+├── review-0-policy.json
+└── ...
+```
+
+The request includes exactly what the application passed to `responses.parse`,
+including the strict JSON Schema. Responses include public IDs, usage, latency,
+raw structured text and parsed output. Policy files show why the review was
+applied or withheld. Credentials, headers and private model reasoning are not
+recorded. Trace paths are relative, and trace files are explicitly labeled as
+potentially sensitive because they contain recipe and review text.
+
+Run the hand-labeled evaluation of all 12 featured reviews:
+
+```bash
+uv run python src/evaluate_extractions.py
+```
+
+Rescore an existing full report without making model calls:
+
+```bash
+uv run python src/evaluate_extractions.py --replay-report outputs/evaluation-report.json --output outputs/evaluation-replay.json
+```
+
+Outputs are written below `outputs/` and intentionally ignored by git because
+they contain model-generated experiment data.
+
+## Verified result
+
+The final field-aware `gpt-5.6-terra` run covered all 12 featured reviews, 34
+intent labels, 20 primary outcome labels and 14 exact edit expectations:
+
+- 88.2% intent recall and 81.1% labeled precision
+- 100% evidence-state accuracy and 90.0% actionability accuracy on matched intents
+- 100% intent/outcome quote grounding and 100% primary-outcome recall
+- 100% bundle-status and candidate-presence accuracy
+- 100% edit target/operation recall and precision
+- 100% exact precondition and required-output accuracy after deterministic replay
+- three exact executable bundles; 3 applied / 7 needs review / 2 not applied
+- zero failed model calls; 27,404 input / 12,652 output tokens; 157.2 seconds
+
+The replay changed only scoring for explicitly enumerated equivalent fractions and
+valid insertion anchors; it did not alter extracted model output. The sanitized
+summary, thresholds and artifact hashes are committed at
+[`evaluation/benchmark_summary.json`](evaluation/benchmark_summary.json).
+
+This remains a small, curated, assignment-specific evaluation—not a production or
+food-safety guarantee. It now measures exact executable edits, but still needs a
+separate holdout corpus and broader repeated-run/model-comparison testing.
+
+See [the assessment report](docs/assessment_report.md),
+[transferable architecture patterns and worked examples](docs/architecture_patterns_and_examples.md),
+and [the required agent trajectory](agent_trajectory.md). The 5–7 minute video is
+an external submission item rather than a repository artifact.

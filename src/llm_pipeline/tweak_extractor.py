@@ -1,168 +1,217 @@
-"""
-Step 1: Tweak Extraction & Parsing
+"""Single-pass semantic interpretation using Responses Structured Outputs."""
 
-This module extracts structured modifications from review text using LLM processing.
-It converts natural language descriptions of recipe changes into structured
-ModificationObject instances.
-"""
+from __future__ import annotations
 
-import json
 import os
-from typing import Optional
+import time
+from typing import Any
 
-from loguru import logger
 from openai import OpenAI
-from pydantic import ValidationError
 
-from .models import ModificationObject, Recipe, Review
-from .prompts import build_simple_prompt
+from .grounding import canonicalize_analysis_quotes
+from .models import (
+    ExtractionCall,
+    ModelCallStats,
+    ModelCallTrace,
+    Recipe,
+    RecipeLine,
+    ReviewAnalysis,
+    ReviewEvidence,
+    TraceRequest,
+    TraceResponse,
+)
+from .prompts import EXTRACTION_INSTRUCTIONS, build_extraction_input
+from .security import safe_exception_text
+
+DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_MAX_OUTPUT_TOKENS = 3000
+ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
+
+
+def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
+    value = default if raw is None else float(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    value = default if raw is None else int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+class ExtractionError(RuntimeError):
+    def __init__(self, message: str, trace: ModelCallTrace | None = None) -> None:
+        super().__init__(message)
+        self.trace = trace
+
+
+def _usage(response: Any, field: str) -> int:
+    usage = getattr(response, "usage", None)
+    value = getattr(usage, field, 0) if usage is not None else 0
+    return value if isinstance(value, int) else 0
 
 
 class TweakExtractor:
-    """Extracts structured modifications from review text using LLM processing."""
+    """The LLM interprets language; it never mutates a recipe."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-3.5-turbo"):
-        """
-        Initialize the TweakExtractor.
-
-        Args:
-            api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
-            model: OpenAI model to use for extraction
-        """
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-        self.model = model
-        logger.info(f"Initialized TweakExtractor with model: {model}")
-
-    def extract_modification(
+    def __init__(
         self,
-        review: Review,
+        api_key: str | None = None,
+        model: str | None = None,
+        client: Any | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self.model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+        if not self.model.strip():
+            raise ValueError("OpenAI model name must not be empty")
+        self._api_key = api_key
+        self._client = client
+        self.timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else _bounded_float("OPENAI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS, 1.0, 300.0)
+        )
+        if not 1.0 <= self.timeout_seconds <= 300.0:
+            raise ValueError("timeout_seconds must be between 1 and 300")
+        self.max_retries = (
+            max_retries
+            if max_retries is not None
+            else _bounded_int("OPENAI_MAX_RETRIES", DEFAULT_MAX_RETRIES, 0, 5)
+        )
+        if not 0 <= self.max_retries <= 5:
+            raise ValueError("max_retries must be between 0 and 5")
+        self.reasoning_effort = reasoning_effort or os.getenv("OPENAI_REASONING_EFFORT", "medium")
+        if self.reasoning_effort not in ALLOWED_REASONING_EFFORTS:
+            raise ValueError(
+                "OPENAI_REASONING_EFFORT must be one of: "
+                + ", ".join(sorted(ALLOWED_REASONING_EFFORTS))
+            )
+        self.max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else _bounded_int("OPENAI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, 256, 10_000)
+        )
+        if not 256 <= self.max_output_tokens <= 10_000:
+            raise ValueError("max_output_tokens must be between 256 and 10000")
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            api_key = self._api_key or os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ExtractionError("OPENAI_API_KEY is not configured")
+            self._client = OpenAI(
+                api_key=api_key,
+                timeout=self.timeout_seconds,
+                max_retries=self.max_retries,
+            )
+        return self._client
+
+    def analyze(
+        self,
+        review: ReviewEvidence,
         recipe: Recipe,
-        max_retries: int = 2,
-    ) -> Optional[ModificationObject]:
-        """
-        Extract a structured modification from a review.
-
-        Args:
-            review: Review object containing modification text
-            recipe: Original recipe being modified
-            max_retries: Number of retry attempts if parsing fails
-
-        Returns:
-            ModificationObject if extraction successful, None otherwise
-        """
-        if not review.has_modification:
-            logger.warning("Review has no modification flag set")
-            return None
-
-        # Build the prompt - use simple prompt to avoid format string issues
-        prompt = build_simple_prompt(
-            review.text, recipe.title, recipe.ingredients, recipe.instructions
+        recipe_lines: list[RecipeLine],
+        *,
+        capture_trace: bool = False,
+    ) -> ExtractionCall:
+        request_input = build_extraction_input(review, recipe, recipe_lines)
+        request_arguments = {
+            "model": self.model,
+            "instructions": EXTRACTION_INSTRUCTIONS,
+            "input": request_input,
+            "text_format": ReviewAnalysis,
+            "reasoning": {"effort": self.reasoning_effort},
+            "max_output_tokens": self.max_output_tokens,
+            "tools": [],
+            "parallel_tool_calls": False,
+            "store": False,
+        }
+        trace_request = (
+            TraceRequest(
+                model=self.model,
+                instructions=EXTRACTION_INSTRUCTIONS,
+                input=request_input,
+                text_format=ReviewAnalysis.__name__,
+                output_schema=ReviewAnalysis.model_json_schema(),
+                reasoning={"effort": self.reasoning_effort},
+                max_output_tokens=self.max_output_tokens,
+                tools=[],
+                parallel_tool_calls=False,
+                store=False,
+            )
+            if capture_trace
+            else None
         )
-
-        logger.debug(
-            "Extracting modification from review: {}...".format(review.text[:100])
-        )
-
-        for attempt in range(max_retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,  # Low temperature for consistent extractions
-                    max_tokens=1000,
+        started = time.perf_counter()
+        try:
+            response = self.client.responses.parse(**request_arguments)
+        except Exception as exc:
+            latency = time.perf_counter() - started
+            safe_error = safe_exception_text(exc)
+            trace = (
+                ModelCallTrace(
+                    review_id=review.review_id,
+                    request=trace_request,
+                    error=safe_error,
                 )
+                if trace_request is not None
+                else None
+            )
+            raise ExtractionError(f"Responses API call failed: {safe_error}", trace) from exc
 
-                raw_output = response.choices[0].message.content
-                logger.debug(f"LLM raw output: {raw_output}")
-
-                # Check if we got a response
-                if not raw_output:
-                    logger.warning(f"Attempt {attempt + 1}: Empty response from LLM")
-                    continue
-
-                # Parse and validate the JSON response
-                modification_data = json.loads(raw_output)
-                modification = ModificationObject(**modification_data)
-
-                logger.info(
-                    f"Successfully extracted {modification.modification_type} "
-                    f"modification with {len(modification.edits)} edits"
-                )
-                return modification
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"Attempt {attempt + 1}: Failed to parse JSON: {e}")
-                if attempt == max_retries:
-                    logger.error(f"Max retries reached. Raw output: {raw_output}")
-
-            except ValidationError as e:
-                logger.warning(f"Attempt {attempt + 1}: Validation error: {e}")
-                if attempt == max_retries:
-                    logger.error(
-                        f"Max retries reached. Invalid data: {modification_data}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1}: Unexpected error: {e}")
-                if attempt == max_retries:
-                    return None
-
-        return None
-
-    def extract_single_modification(
-        self, reviews: list[Review], recipe: Recipe
-    ) -> tuple[ModificationObject, Review] | tuple[None, None]:
-        """
-        Extract modification from a single randomly selected review.
-
-        Args:
-            reviews: List of reviews to choose from
-            recipe: Original recipe being modified
-
-        Returns:
-            Tuple of (ModificationObject, source_Review) if successful, (None, None) otherwise
-        """
-        import random
-
-        # Filter to reviews with modifications
-        modification_reviews = [r for r in reviews if r.has_modification]
-
-        if not modification_reviews:
-            logger.warning("No reviews with modifications found")
-            return None, None
-
-        # Select one random review
-        selected_review = random.choice(modification_reviews)
-        logger.info(f"Selected review: {selected_review.text[:100]}...")
-
-        modification = self.extract_modification(selected_review, recipe)
-        if modification:
-            logger.info("Successfully extracted modification from selected review")
-            return modification, selected_review
-        else:
-            logger.warning("Failed to extract modification from selected review")
-            return None, None
-
-    def test_extraction(
-        self, review_text: str, recipe_data: dict
-    ) -> Optional[ModificationObject]:
-        """
-        Test extraction with raw text and recipe data.
-
-        Args:
-            review_text: Raw review text
-            recipe_data: Raw recipe dictionary
-
-        Returns:
-            ModificationObject if successful
-        """
-        review = Review(text=review_text, has_modification=True)
-        recipe = Recipe(
-            recipe_id=recipe_data.get("recipe_id", "test"),
-            title=recipe_data.get("title", "Test Recipe"),
-            ingredients=recipe_data.get("ingredients", []),
-            instructions=recipe_data.get("instructions", []),
+        latency = time.perf_counter() - started
+        analysis = getattr(response, "output_parsed", None)
+        output_text = getattr(response, "output_text", None)
+        response_trace = (
+            TraceResponse(
+                response_id=getattr(response, "id", None),
+                model=getattr(response, "model", self.model),
+                status=getattr(response, "status", None),
+                input_tokens=_usage(response, "input_tokens"),
+                output_tokens=_usage(response, "output_tokens"),
+                latency_seconds=round(latency, 6),
+                output_text=output_text if isinstance(output_text, str) else None,
+                output_parsed=analysis if isinstance(analysis, ReviewAnalysis) else None,
+            )
+            if trace_request is not None
+            else None
         )
-
-        return self.extract_modification(review, recipe)
+        trace = (
+            ModelCallTrace(
+                review_id=review.review_id,
+                request=trace_request,
+                response=response_trace,
+            )
+            if trace_request is not None
+            else None
+        )
+        if not isinstance(analysis, ReviewAnalysis):
+            raise ExtractionError("Model returned no parsed structured output", trace)
+        if analysis.review_id != review.review_id:
+            raise ExtractionError("Model returned a mismatched review_id", trace)
+        analysis, canonicalized_quote_count = canonicalize_analysis_quotes(analysis, review.text)
+        return ExtractionCall(
+            analysis=analysis,
+            stats=ModelCallStats(
+                review_id=review.review_id,
+                model=getattr(response, "model", self.model),
+                response_id=getattr(response, "id", None),
+                status=getattr(response, "status", None),
+                input_tokens=_usage(response, "input_tokens"),
+                output_tokens=_usage(response, "output_tokens"),
+                latency_seconds=round(latency, 6),
+                canonicalized_source_quotes=canonicalized_quote_count,
+            ),
+            trace=trace,
+        )

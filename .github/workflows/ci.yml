@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          version: "0.12.5"
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev
+      - name: Validate evaluation labels
+        run: python -m json.tool evaluation/golden_labels.json > /dev/null
+      - name: Lint
+        run: uv run ruff check src tests
+      - name: Check formatting
+        run: uv run ruff format --check src tests
+      - name: Test with coverage gate
+        run: uv run pytest --cov=llm_pipeline --cov=run_pipeline --cov-report=term-missing --cov-fail-under=90 -q
+      - name: Compile
+        run: uv run python -m compileall -q src
+      - name: Security lint
+        run: uv run bandit -r src -q
+      - name: Type check
+        if: matrix.python-version == '3.13'
+        run: uv run pyright src
+      - name: Audit runtime dependencies
+        if: matrix.python-version == '3.13'
+        run: |
+          uv export --format requirements-txt --no-dev --no-hashes --output-file "$RUNNER_TEMP/requirements.txt"
+          uvx --from pip-audit==2.10.1 pip-audit -r "$RUNNER_TEMP/requirements.txt" --progress-spinner off

@@ -1,301 +1,316 @@
-"""
-LLM Analysis Pipeline - Main Orchestrator
+"""Orchestrate evidence extraction, policy, and independent recipe variants."""
 
-This module coordinates the complete 3-step pipeline:
-1. Extract modifications from reviews
-2. Apply modifications to recipes
-3. Generate enhanced recipes with attribution
-
-Processes recipe data from scraped JSON files and outputs enhanced recipes.
-"""
+from __future__ import annotations
 
 import json
+import os
+import re
+import tempfile
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Protocol
 
-from dotenv import load_dotenv
-from loguru import logger
-
-from .enhanced_recipe_generator import EnhancedRecipeGenerator
-from .models import EnhancedRecipe, Recipe, Review
-from .recipe_modifier import RecipeModifier
+from .models import (
+    DirectoryRun,
+    ExtractionCall,
+    ModelCallStats,
+    PipelineResult,
+    PolicyTrace,
+    Recipe,
+    RecipeLine,
+    ReviewAnalysis,
+    ReviewEvidence,
+    RunTrace,
+)
+from .normalization import build_recipe_lines, normalize_featured_reviews, parse_recipe
+from .recipe_modifier import evaluate_review_bundle
+from .security import safe_exception_text
 from .tweak_extractor import TweakExtractor
+from .version import PIPELINE_VERSION
+
+MAX_RECIPE_FILES_PER_RUN = 50
+MAX_MODEL_CALLS_PER_DIRECTORY_RUN = 100
+
+_SAFE_OUTPUT_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
+_WINDOWS_RESERVED_NAMES = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *{f"com{number}" for number in range(1, 10)},
+    *{f"lpt{number}" for number in range(1, 10)},
+}
+
+
+def safe_output_component(value: str) -> str:
+    """Return a stable filesystem component without trusting a source identifier."""
+    normalized = _SAFE_OUTPUT_COMPONENT.sub("_", value).strip("._")
+    if not normalized:
+        normalized = "recipe"
+    normalized = normalized[:80]
+    if (
+        normalized != value
+        or normalized.casefold() in _WINDOWS_RESERVED_NAMES
+        or value != value.casefold()
+    ):
+        digest = sha256(value.encode("utf-8")).hexdigest()[:10]
+        normalized = f"{normalized}-{digest}"
+    return normalized
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _recipe_output_directory(root: Path, recipe_id: str) -> Path:
+    resolved_root = root.resolve()
+    candidate = resolved_root / safe_output_component(recipe_id)
+    if candidate.is_symlink():
+        raise ValueError("Recipe output directory may not be a symbolic link")
+    destination = candidate.resolve()
+    if destination.parent != resolved_root:
+        raise ValueError("Resolved recipe output escaped the configured output directory")
+    return destination
+
+
+class Extractor(Protocol):
+    def analyze(
+        self,
+        review: ReviewEvidence,
+        recipe: Recipe,
+        recipe_lines: list[RecipeLine],
+        *,
+        capture_trace: bool = False,
+    ) -> ExtractionCall: ...
 
 
 class LLMAnalysisPipeline:
-    """Complete pipeline for analyzing recipes and generating enhanced versions."""
+    def __init__(self, extractor: Extractor | None = None) -> None:
+        self.extractor = extractor or TweakExtractor()
 
-    def __init__(
-        self,
-        openai_api_key: Optional[str] = None,
-        output_dir: str = "data/enhanced",
-        pipeline_version: str = "1.0.0",
-    ):
-        """
-        Initialize the complete LLM Analysis Pipeline.
+    def _process_recipe_data(
+        self, raw: dict[str, Any], *, capture_trace: bool
+    ) -> tuple[PipelineResult, RunTrace | None]:
+        original = parse_recipe(raw)
+        lines = build_recipe_lines(original)
+        reviews = normalize_featured_reviews(raw, original.recipe_id)
+        analyses: list[ReviewAnalysis] = []
+        decisions = []
+        candidates = []
+        failures: dict[str, str] = {}
+        call_stats: list[ModelCallStats] = []
+        model_traces = []
+        policy_traces: list[PolicyTrace] = []
 
-        Args:
-            openai_api_key: OpenAI API key (loads from env if not provided)
-            output_dir: Directory to save enhanced recipes
-            pipeline_version: Version identifier for tracking
-        """
-        # Load environment variables
-        load_dotenv()
-
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Initialize pipeline components
-        self.tweak_extractor = TweakExtractor(api_key=openai_api_key)
-        self.recipe_modifier = RecipeModifier()
-        self.enhanced_generator = EnhancedRecipeGenerator(
-            pipeline_version=pipeline_version
-        )
-
-        logger.info(f"Initialized LLM Analysis Pipeline v{pipeline_version}")
-        logger.info(f"Output directory: {self.output_dir}")
-
-    def load_recipe_data(self, file_path: str) -> Dict[str, Any]:
-        """
-        Load recipe data from JSON file.
-
-        Args:
-            file_path: Path to recipe JSON file
-
-        Returns:
-            Recipe data dictionary
-        """
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def parse_recipe_data(self, recipe_data: Dict[str, Any]) -> Recipe:
-        """
-        Parse raw recipe data into Recipe object.
-
-        Args:
-            recipe_data: Raw recipe data from JSON
-
-        Returns:
-            Recipe object
-        """
-        return Recipe(
-            recipe_id=recipe_data.get("recipe_id", "unknown"),
-            title=recipe_data.get("title", "Unknown Recipe"),
-            ingredients=recipe_data.get("ingredients", []),
-            instructions=recipe_data.get("instructions", []),
-            description=recipe_data.get("description"),
-            servings=recipe_data.get("servings"),
-            rating=recipe_data.get("rating"),
-        )
-
-    def parse_reviews_data(self, recipe_data: Dict[str, Any]) -> List[Review]:
-        """
-        Parse raw review data into Review objects.
-
-        Args:
-            recipe_data: Raw recipe data containing reviews
-
-        Returns:
-            List of Review objects
-        """
-        reviews = []
-        raw_reviews = recipe_data.get("reviews", [])
-
-        for review_data in raw_reviews:
-            if review_data.get("text"):
-                review = Review(
-                    text=review_data["text"],
-                    rating=review_data.get("rating"),
-                    username=review_data.get("username"),
-                    has_modification=review_data.get("has_modification", False),
+        for review in reviews:
+            try:
+                call = self.extractor.analyze(
+                    review,
+                    original,
+                    lines,
+                    capture_trace=capture_trace,
                 )
-                reviews.append(review)
+                analysis = call.analysis
+                if analysis.review_id != review.review_id:
+                    raise ValueError("Extractor returned a mismatched review_id")
+                analyses.append(analysis)
+                call_stats.append(call.stats)
+                if call.trace is not None:
+                    model_traces.append(call.trace)
+                decision, candidate = evaluate_review_bundle(original, lines, review, analysis)
+                decisions.append(decision)
+                if candidate is not None:
+                    candidates.append(candidate)
+                if capture_trace:
+                    policy_traces.append(
+                        PolicyTrace(
+                            review_id=review.review_id,
+                            decision=decision,
+                            candidate=candidate,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001 - isolate failures per review
+                failures[review.review_id] = safe_exception_text(exc)
+                failed_trace = getattr(exc, "trace", None)
+                if capture_trace and failed_trace is not None:
+                    model_traces.append(failed_trace)
 
-        return reviews
+        limitations = [
+            "Candidates are independent alternatives; cross-review changes are not merged.",
+            "Candidates are not ranked because the supplied data has no helpful-vote signal.",
+            "Only featured_tweaks are treated as in-scope evidence.",
+        ]
+        if not reviews:
+            limitations.append("This recipe has no featured tweaks, so no model call was made.")
 
-    def process_single_recipe(
-        self, recipe_file: str, save_output: bool = True
-    ) -> Optional[EnhancedRecipe]:
-        """
-        Process a single recipe through the complete pipeline.
-
-        Args:
-            recipe_file: Path to recipe JSON file
-            save_output: Whether to save the enhanced recipe
-
-        Returns:
-            EnhancedRecipe if successful, None otherwise
-        """
-        try:
-            logger.info(f"Processing recipe file: {recipe_file}")
-
-            # Step 0: Load and parse data
-            recipe_data = self.load_recipe_data(recipe_file)
-            recipe = self.parse_recipe_data(recipe_data)
-            reviews = self.parse_reviews_data(recipe_data)
-
-            logger.info(f"Loaded recipe: {recipe.title}")
-            logger.info(
-                f"Found {len(reviews)} reviews, {len([r for r in reviews if r.has_modification])} with modifications"
-            )
-
-            if not any(r.has_modification for r in reviews):
-                logger.warning("No reviews with modifications found")
-                return None
-
-            # Step 1: Extract modification from one random review
-            logger.info("Step 1: Extracting modification from a single review...")
-            modification, source_review = (
-                self.tweak_extractor.extract_single_modification(reviews, recipe)
-            )
-
-            if not modification or not source_review:
-                logger.warning("No modification could be extracted")
-                return None
-
-            logger.info(
-                f"Successfully extracted {modification.modification_type} modification"
-            )
-
-            # Step 2: Apply modification to recipe
-            logger.info("Step 2: Applying modification to recipe...")
-            modified_recipe, change_records = self.recipe_modifier.apply_modification(
-                recipe, modification
-            )
-
-            logger.info(
-                f"Applied modification: {len(change_records)} total changes made"
-            )
-
-            # Step 3: Generate enhanced recipe with attribution
-            logger.info("Step 3: Generating enhanced recipe with attribution...")
-
-            enhanced_recipe = self.enhanced_generator.generate_enhanced_recipe(
-                recipe, modified_recipe, modification, source_review, change_records
-            )
-
-            logger.info(f"Generated enhanced recipe: {enhanced_recipe.title}")
-
-            # Save output
-            if save_output:
-                output_filename = f"enhanced_{recipe.recipe_id}_{recipe.title.lower().replace(' ', '-')[:30]}.json"
-                output_path = self.output_dir / output_filename
-                self.enhanced_generator.save_enhanced_recipe(
-                    enhanced_recipe, str(output_path)
-                )
-
-            return enhanced_recipe
-
-        except Exception as e:
-            logger.error(f"Failed to process recipe {recipe_file}: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return None
-
-    def process_recipe_directory(self, data_dir: str = "data") -> List[EnhancedRecipe]:
-        """
-        Process all recipe files in a directory.
-
-        Args:
-            data_dir: Directory containing recipe JSON files
-
-        Returns:
-            List of successfully processed EnhancedRecipe objects
-        """
-        data_path = Path(data_dir)
-        recipe_files = list(data_path.glob("recipe_*.json"))
-
-        logger.info(f"Found {len(recipe_files)} recipe files to process")
-
-        enhanced_recipes = []
-        for recipe_file in recipe_files:
-            logger.info(f"\n{'=' * 60}")
-            enhanced_recipe = self.process_single_recipe(str(recipe_file))
-
-            if enhanced_recipe:
-                enhanced_recipes.append(enhanced_recipe)
-                logger.info(f"✓ Successfully processed: {enhanced_recipe.title}")
-            else:
-                logger.warning(f"✗ Failed to process: {recipe_file.name}")
-
-        logger.info(f"\n{'=' * 60}")
-        logger.info(
-            f"Pipeline complete: {len(enhanced_recipes)}/{len(recipe_files)} recipes successfully enhanced"
+        result = PipelineResult(
+            pipeline_version=PIPELINE_VERSION,
+            original_recipe=original,
+            featured_reviews=reviews,
+            analyses=analyses,
+            decisions=decisions,
+            candidates=candidates,
+            extraction_failures=failures,
+            model_calls=call_stats,
+            limitations=limitations,
         )
-
-        return enhanced_recipes
-
-    def generate_summary_report(
-        self, enhanced_recipes: List[EnhancedRecipe]
-    ) -> Dict[str, Any]:
-        """
-        Generate a summary report of pipeline results.
-
-        Args:
-            enhanced_recipes: List of enhanced recipes
-
-        Returns:
-            Summary report dictionary
-        """
-        if not enhanced_recipes:
-            return {"status": "no_recipes_processed"}
-
-        total_modifications = sum(
-            len(recipe.modifications_applied) for recipe in enhanced_recipes
+        trace = (
+            RunTrace(
+                recipe_id=original.recipe_id,
+                model_calls=model_traces,
+                policy_decisions=policy_traces,
+                extraction_failures=failures,
+            )
+            if capture_trace
+            else None
         )
-        total_changes = sum(
-            recipe.enhancement_summary.total_changes for recipe in enhanced_recipes
-        )
+        return result, trace
 
-        change_type_counts = {}
-        for recipe in enhanced_recipes:
-            for change_type in recipe.enhancement_summary.change_types:
-                change_type_counts[change_type] = (
-                    change_type_counts.get(change_type, 0) + 1
-                )
+    def process_recipe_data(self, raw: dict[str, Any]) -> PipelineResult:
+        result, _ = self._process_recipe_data(raw, capture_trace=False)
+        return result
 
-        report = {
-            "pipeline_summary": {
-                "recipes_processed": len(enhanced_recipes),
-                "total_modifications_applied": total_modifications,
-                "total_changes_made": total_changes,
-                "change_type_distribution": change_type_counts,
-            },
-            "enhanced_recipes": [
-                {
-                    "recipe_id": recipe.recipe_id,
-                    "title": recipe.title,
-                    "modifications_count": len(recipe.modifications_applied),
-                    "changes_count": recipe.enhancement_summary.total_changes,
-                    "change_types": recipe.enhancement_summary.change_types,
-                }
-                for recipe in enhanced_recipes
-            ],
+    def process_recipe_data_with_trace(
+        self, raw: dict[str, Any]
+    ) -> tuple[PipelineResult, RunTrace]:
+        result, trace = self._process_recipe_data(raw, capture_trace=True)
+        if trace is None:  # pragma: no cover - guaranteed by capture_trace=True
+            raise RuntimeError("Trace capture was requested but not produced")
+        return result, trace
+
+    def process_file(self, recipe_path: str | Path) -> PipelineResult:
+        path = Path(recipe_path)
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return self.process_recipe_data(raw)
+
+    def process_file_with_trace(self, recipe_path: str | Path) -> tuple[PipelineResult, RunTrace]:
+        path = Path(recipe_path)
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return self.process_recipe_data_with_trace(raw)
+
+    @staticmethod
+    def save_result(result: PipelineResult, output_path: str | Path) -> Path:
+        path = Path(output_path)
+        atomic_write_text(path, result.model_dump_json(indent=2))
+        return path
+
+    @staticmethod
+    def result_output_path(output_dir: str | Path, recipe_id: str) -> Path:
+        return _recipe_output_directory(Path(output_dir), recipe_id) / "result.json"
+
+    @staticmethod
+    def save_trace(
+        trace: RunTrace,
+        trace_dir: str | Path,
+        result_path: str | Path,
+    ) -> Path:
+        """Write review-level trace files without credentials or HTTP headers."""
+        destination = Path(trace_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        written_files: list[str] = []
+
+        for call in trace.model_calls:
+            rank = call.review_id.rsplit(":", maxsplit=1)[-1]
+            request_name = f"review-{rank}-request.json"
+            response_name = f"review-{rank}-response.json"
+            atomic_write_text(destination / request_name, call.request.model_dump_json(indent=2))
+            response_payload = {
+                "review_id": call.review_id,
+                "response": call.response.model_dump(mode="json")
+                if call.response is not None
+                else None,
+                "error": call.error,
+            }
+            atomic_write_text(destination / response_name, json.dumps(response_payload, indent=2))
+            written_files.extend([request_name, response_name])
+
+        for policy in trace.policy_decisions:
+            rank = policy.review_id.rsplit(":", maxsplit=1)[-1]
+            policy_name = f"review-{rank}-policy.json"
+            atomic_write_text(destination / policy_name, policy.model_dump_json(indent=2))
+            written_files.append(policy_name)
+
+        result = Path(result_path)
+        resolved_destination = destination.resolve()
+        summary = {
+            "trace_version": trace.trace_version,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "recipe_id": trace.recipe_id,
+            "result_path": os.path.relpath(result.resolve(), start=resolved_destination),
+            "trace_path": ".",
+            "model_call_count": len(trace.model_calls),
+            "policy_decision_count": len(trace.policy_decisions),
+            "extraction_failures": trace.extraction_failures,
+            "files": sorted(written_files),
+            "disclosure": trace.disclosure,
         }
+        summary_path = destination / "run-summary.json"
+        atomic_write_text(summary_path, json.dumps(summary, indent=2))
+        return summary_path
 
-        return report
-
-    def save_summary_report(
-        self, enhanced_recipes: List[EnhancedRecipe], output_path: Optional[str] = None
-    ) -> str:
-        """
-        Save pipeline summary report to JSON file.
-
-        Args:
-            enhanced_recipes: List of enhanced recipes
-            output_path: Path to save report (auto-generated if None)
-
-        Returns:
-            Path to saved report
-        """
-        if output_path is None:
-            output_path = str(self.output_dir / "pipeline_summary_report.json")
-
-        report = self.generate_summary_report(enhanced_recipes)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Saved pipeline summary report to: {output_path}")
-        return output_path
+    def process_directory(
+        self,
+        data_dir: str | Path,
+        output_dir: str | Path,
+        *,
+        capture_trace: bool = False,
+    ) -> DirectoryRun:
+        source = Path(data_dir)
+        destination = Path(output_dir)
+        if not source.is_dir():
+            raise ValueError(f"Recipe data directory does not exist: {source}")
+        recipe_paths = sorted(source.glob("recipe_*.json"))
+        if not recipe_paths:
+            raise ValueError(f"No recipe_*.json files found in: {source}")
+        if len(recipe_paths) > MAX_RECIPE_FILES_PER_RUN:
+            raise ValueError(
+                f"A directory run may contain at most {MAX_RECIPE_FILES_PER_RUN} recipe files"
+            )
+        results: list[PipelineResult] = []
+        file_failures: dict[str, str] = {}
+        planned_model_calls = 0
+        for recipe_path in recipe_paths:
+            try:
+                with recipe_path.open("r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+                original = parse_recipe(raw)
+                review_count = len(normalize_featured_reviews(raw, original.recipe_id))
+                if planned_model_calls + review_count > MAX_MODEL_CALLS_PER_DIRECTORY_RUN:
+                    raise ValueError(
+                        "Directory run exceeds the "
+                        f"{MAX_MODEL_CALLS_PER_DIRECTORY_RUN}-call model budget"
+                    )
+                planned_model_calls += review_count
+                result, trace = self._process_recipe_data(raw, capture_trace=capture_trace)
+                result_path = self.result_output_path(destination, result.original_recipe.recipe_id)
+                recipe_dir = result_path.parent
+                self.save_result(result, result_path)
+                if trace is not None:
+                    self.save_trace(trace, recipe_dir / "trace", result_path)
+                results.append(result)
+            except Exception as exc:  # noqa: BLE001 - isolate malformed source files
+                file_failures[recipe_path.name] = safe_exception_text(exc)
+        return DirectoryRun(results=results, file_failures=file_failures)
