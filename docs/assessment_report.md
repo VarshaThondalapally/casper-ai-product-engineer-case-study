@@ -13,14 +13,39 @@ featured review once, preserves all atomic intents and their evidence states,
 then hands control to deterministic policy. Each review can produce one
 transactional alternative from the original recipe; reviews are not combined.
 
+## Assumptions and scope
+
+- `featured_tweaks` is the authoritative evidence set for this assignment. Other
+  reviews are not silently promoted into the pipeline.
+- One review represents one observed experiment. Its performed changes may have
+  been tasted together, so they are applied atomically rather than cherry-picked.
+- Different reviews are independent alternatives from an immutable original;
+  they are not cumulative instructions and are never merged implicitly.
+- Only grounded, complete, performed changes are eligible for execution.
+  Recommendations, future plans, preferences and hypotheses remain visible but
+  do not become recipe mutations.
+- The supplied recipe lines are the current source of truth. An edit may execute
+  only when its stable line ID exists and its complete expected text still
+  matches exactly.
+- The data has no trustworthy helpful-vote or controlled-comparison signal, so
+  the system does not invent a primary candidate or rank alternatives.
+- Model output is untrusted interpretation, not authorization. Deterministic
+  software owns grounding, conflict detection, preconditions and mutation.
+- A recipe with no featured tweaks is a valid zero-call result. A malformed file
+  or failed model call is an explicit failure, not an empty success.
+- The six supplied recipes and 12 featured reviews support an assignment-specific
+  evaluation, not a claim of broad recipe-domain or food-safety generalization.
+- Live execution requires an OpenAI API key and access to the configured model;
+  deterministic tests, policy checks and benchmark replay do not require an API
+  call.
+
 ## Why the initial implementation was not extended
 
 An abandoned candidate implementation's 37 tests passed. It nevertheless had the
-wrong shape for a four-hour assessment: roughly 6,500 added lines,
-initial/revision/verifier
-model passes, regex-driven semantic gates, a large taxonomy, and an older default
-model. Its self-reported perfect evaluation did not compensate for the complexity
-or the small number of useful outputs.
+wrong shape for a four-hour assessment: roughly 6,500 added lines, separate
+initial/revision/verifier model passes, regex-driven semantic gates, a large
+taxonomy, and an older default model. Its self-reported perfect evaluation did
+not compensate for the complexity or the small number of useful outputs.
 
 The final implementation therefore restarted from the supplied source baseline
 and retained only the architecture justified by the data and evaluation.
@@ -90,6 +115,96 @@ Detailed transferables and all early worked examples—including same-target sug
 conflicts, different-stage sugar/egg/air-fryer reviews, evidence states, no-ops,
 multi-line intents, and alternatives—are preserved in
 `docs/architecture_patterns_and_examples.md`.
+
+## System design
+
+The system intentionally separates semantic interpretation from execution
+authority. The LLM can describe meaning and propose typed edits, but only the
+deterministic policy layer can authorize a transactional candidate.
+
+```mermaid
+flowchart LR
+    U["Engineer or reviewer"] -->|"Runs CLI"| CLI["Pipeline CLI"]
+    D["Supplied recipe JSON"] --> CLI
+    CLI --> N["Validation and normalization"]
+
+    N --> R["Immutable original recipe"]
+    N --> F["Distinct featured reviews"]
+    N --> L["Stable recipe line IDs"]
+
+    F --> E["Semantic extraction"]
+    R --> E
+    L --> E
+    E -->|"Strict structured request"| OAI["OpenAI Responses API"]
+    OAI -->|"ReviewAnalysis"| G["Evidence canonicalization"]
+
+    G --> P["Deterministic policy"]
+    R --> P
+    L --> P
+
+    P -->|"Entire performed bundle is safe"| A["Transactional exact edits"]
+    P -->|"Performed but incomplete or unsafe"| NR["needs_review"]
+    P -->|"No performed change"| NA["not_applied"]
+    P -->|"API or validation error"| EF["Explicit failure"]
+
+    A --> C["Independent candidate"]
+    C --> OUT["result.json"]
+    NR --> OUT
+    NA --> OUT
+    EF --> OUT
+
+    E -. "Optional request and response trace" .-> T["Redacted trace files"]
+    P -. "Policy decision and provenance" .-> T
+
+    GL["Golden labels"] --> EV["Evaluation and replay harness"]
+    OUT --> EV
+    EV --> BM["Metrics, thresholds and hashes"]
+```
+
+### One-review execution sequence
+
+```mermaid
+sequenceDiagram
+    actor Engineer
+    participant CLI as run_pipeline.py
+    participant Pipeline as Pipeline
+    participant Normalizer as Validation
+    participant Extractor as LLM extractor
+    participant OpenAI as Responses API
+    participant Policy as Deterministic policy
+    participant Modifier as Exact modifier
+    participant Storage as Result and trace storage
+
+    Engineer->>CLI: Run one file or the supplied data directory
+    CLI->>Pipeline: Process source with optional trace
+    Pipeline->>Normalizer: Parse recipe and featured reviews
+    Normalizer-->>Pipeline: Immutable recipe, line IDs and review evidence
+
+    loop Every distinct featured review
+        Pipeline->>Extractor: Analyze review independently
+        Extractor->>OpenAI: Prompt, bounded input and strict schema
+        OpenAI-->>Extractor: Parsed ReviewAnalysis
+        Extractor-->>Pipeline: Canonicalized analysis, usage and optional raw trace
+        Pipeline->>Policy: Evaluate the complete review bundle
+
+        alt All performed intents are safe
+            Policy->>Modifier: Apply all exact edits transactionally
+            Modifier-->>Pipeline: Independent attributed candidate
+        else Performed evidence is incomplete or unsafe
+            Policy-->>Pipeline: needs_review with reasons, no candidate
+        else No performed intent exists
+            Policy-->>Pipeline: not_applied, no candidate
+        end
+
+        opt Trace enabled
+            Pipeline->>Storage: Save request, response and policy artifacts
+        end
+    end
+
+    Pipeline->>Storage: Atomically save result.json
+    Pipeline-->>CLI: Counts, paths, failures and reliable exit status
+    CLI-->>Engineer: 0 success, 1 partial failure, or 2 fatal failure
+```
 
 ## Design decisions
 
@@ -214,7 +329,7 @@ contain complete review/model content.
   edit fragment in the seven needs-review reviews.
 - Three strict runs exposed meaningful model variance, but this is still too few
   for production confidence; add a larger holdout and at least five frozen runs.
-- Medium reasoning took about 140 seconds sequentially. Compare Terra against
+- Medium reasoning took about 157 seconds sequentially. Compare Terra against
   Luna on the same frozen labels before choosing a cheaper model or parallelism.
 - No food-safety, allergen, nutrition, or serving-scale validation is claimed.
 - Cross-review merging and ranking require product rules and stronger evidence;
@@ -223,6 +338,14 @@ contain complete review/model content.
 ## Assessment deliverable map
 
 - Comprehensive technical narrative: this report
+  - Assumptions: `Assumptions and scope`
+  - Problem analysis and solution approach: `Executive verdict`, `Why the initial
+    implementation was not extended`, and `Before and after`
+  - Technical decisions and rationale: `System design` and `Design decisions`
+  - Implementation details and challenges: `Final engineering audit`,
+    `Observable API and policy boundary`, and `Evaluation`
+  - Future improvements: `Known limitations and next experiments` and
+    `Production next step`
 - Transferable architecture and worked examples:
   `docs/architecture_patterns_and_examples.md`
 - Agent-use trajectory: `agent_trajectory.md`
