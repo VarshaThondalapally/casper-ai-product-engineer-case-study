@@ -1,5 +1,7 @@
 # Recipe Review Evidence Pipeline
 
+[![CI](https://github.com/VarshaThondalapally/recipe-review-evidence-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/VarshaThondalapally/recipe-review-evidence-pipeline/actions/workflows/ci.yml)
+
 This project turns community-tested recipe tweaks into safe, attributed recipe
 alternatives. The LLM interprets open-ended language once; deterministic code
 decides whether the evidence is executable and applies exact edits.
